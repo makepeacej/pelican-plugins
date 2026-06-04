@@ -1,0 +1,23 @@
+{
+    "id": "theme-switcher",
+    "name": "Theme Switcher",
+    "author": "makepeaceJ",
+    "version": "1.0.0",
+    "description": "Per-user theme selection with admin-configurable global default.",
+    "category": "plugin",
+    "url": "https://github.com/makepeacej/pelican-plugins",
+    "update_url": null,
+    "namespace": "ThemeSwitcher",
+    "class": "ThemeSwitcherPlugin",
+    "panels": [
+        "admin",
+        "server",
+        "app"
+    ],
+    "panel_version": null,
+    "composer_packages": null,
+    "meta": {
+        "status": "enabled",
+        "status_message": null
+    }
+}
