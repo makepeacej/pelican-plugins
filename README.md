@@ -1,12 +1,12 @@
 # pelican-plugins
 
 A collection of [Pelican Panel](https://pelican.dev) plugins by makepeaceJ.
+Assisted by Claude CLI.
+Tested in both docker and bare metal installs.
 
 | Plugin | Description |
 |--------|-------------|
 | [`theme-switcher`](theme-switcher/) | Per-user theme selection with an admin-configurable global default. |
-
-More plugins may be added over time — each lives in its own top-level folder with a `plugin.json`.
 
 ---
 
@@ -15,6 +15,11 @@ More plugins may be added over time — each lives in its own top-level folder w
 Lets every panel user pick their own theme from a dropdown injected next to Filament's
 built-in light/dark switcher, and lets an admin set the **global default** theme that applies
 to users who haven't chosen one (including the login page).
+Currently confirmed working themes (If a theme doesn't work, submit an issue and I'll take a look):
+-StarryNight
+-Nord Theme
+-Neobrutalism
+-Fluffy
 
 ### How it works
 
@@ -32,24 +37,7 @@ to users who haven't chosen one (including the login page).
   stored in the panel `.env` as `PANEL_DEFAULT_THEME` (written from the plugin's Settings form).
 
 Static deactivation rules — for themes that inject CSS or DOM through their own render hooks —
-live in `config/theme-manifests.php`. Most themes need no entry there.
-
-### Requirements
-
-- Pelican Panel (Filament v3 based)
-
-### Install
-
-1. Copy the `theme-switcher` folder into your panel's `plugins/` directory:
-   ```
-   plugins/theme-switcher/
-   ```
-2. Run the migration to create the `theme_preferences` table:
-   ```bash
-   php artisan migrate
-   ```
-3. Enable the plugin in the panel admin if it isn't already (its `plugin.json` ships
-   `meta.status: enabled`).
+live in `config/theme-manifests.php`. Most themes so far need no entry there.
 
 ### Configure
 
