@@ -11,6 +11,13 @@ Tested in both docker and bare metal installs.
 ---
 
 ## theme-switcher
+Theme Picker(Scrollable over a certain number of themes):
+
+<img width="380" height="458" alt="image" src="https://github.com/user-attachments/assets/3e5a1354-398c-47c0-b3b7-fb7ddb6ed4ad" />
+
+Global Default Theme (Default theme for users including the login screen):
+
+<img width="1114" height="452" alt="image" src="https://github.com/user-attachments/assets/14a69103-c238-4272-9d97-2a1753bf22c1" />
 
 Lets every panel user pick their own theme from a dropdown injected next to Filament's
 built-in light/dark switcher, and lets an admin set the **global default** theme that applies
