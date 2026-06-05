@@ -366,7 +366,16 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
             $manifest = $this->loadThemeManifest($activeTheme);
             // Always build the CSS override so --font-family is injected via ts-active-style and
             // overrides any font set by other theme plugins' boot() in the compiled Filament CSS.
-            $cssOverride = $this->buildCssOverride($manifest['colors'] ?? [], $manifest['font'] ?? null);
+            //
+            // Layer the theme's colors ON TOP OF Pelican's defaults rather than emitting only the
+            // theme's own keys. boot() runs before the session starts, so it bakes the GLOBAL
+            // DEFAULT theme's palette (e.g. Nord) into the compiled @filamentStyles for everyone.
+            // A user on a different theme that omits some key (notably `gray`, which drives the
+            // panel background) would otherwise inherit the global default's value through the
+            // cascade. Resetting unspecified keys to Pelican defaults here neutralises that leak —
+            // the same reason the 'none' branch below injects the full default palette.
+            $overrideColors = array_replace($this->pelicanDefaultColors(), $manifest['colors'] ?? []);
+            $cssOverride = $this->buildCssOverride($overrideColors, $manifest['font'] ?? null);
             if ($manifest) {
                 if (! empty($manifest['font'])) {
                     $family  = $manifest['font'];
@@ -425,8 +434,11 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
                     if (! $m) {
                         continue;
                     }
+                    // Layer over Pelican defaults (see renderHeadScripts) so an instant switch to a
+                    // theme that omits some color key resets it to Pelican's value instead of leaving
+                    // the global default's leftover (e.g. Nord's gray) showing in the compiled CSS.
                     $manifestsForJs[$themeId] = [
-                        'colors' => $m['colors'] ?? [],
+                        'colors' => array_replace($this->pelicanDefaultColors(), $m['colors'] ?? []),
                         'font'   => $m['font'] ?? null,
                     ];
                     if (! empty($m['viteTheme'])) {
