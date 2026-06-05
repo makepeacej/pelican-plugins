@@ -13,6 +13,7 @@ use Filament\Support\Colors\Color;
 use Filament\Support\Colors\ColorManager;
 use Filament\Support\Facades\FilamentColor;
 use Illuminate\Foundation\Vite;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Route;
 use ReflectionClass;
 use ThemeSwitcher\Http\Controllers\ThemePreferenceController;
@@ -63,7 +64,7 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
         $user = auth()->guard($panel->getAuthGuard())->user();
 
         if ($user) {
-            $pref = ThemePreference::where('user_id', $user->id)->value('theme_id');
+            $pref = $this->readThemePreference($user->id);
             $active = match(true) {
                 $pref === 'default' => 'none',
                 $pref !== null      => $pref,
@@ -164,9 +165,37 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /**
+     * Read a user's saved theme preference, tolerating a missing table.
+     *
+     * During a fresh install — or immediately after a reimport, which drops the table via the
+     * migration's down() before the new install re-runs it — `theme_preferences` may not exist.
+     * A raw query would then throw QueryException and 500 the entire panel on every request
+     * (this plugin's boot()/render hook run for all authenticated traffic). Returning null makes
+     * callers fall back to the global default until the migration runs.
+     */
+    private function readThemePreference(int $userId): ?string
+    {
+        try {
+            return ThemePreference::where('user_id', $userId)->value('theme_id');
+        } catch (\Throwable $e) {
+            // Log once per request so the two call sites (boot + render hook) don't double up,
+            // and so a fresh install doesn't flood the log. Gives the user something concrete
+            // to share when the picker silently falls back to the global default.
+            static $logged = false;
+            if (! $logged) {
+                $logged = true;
+                Log::warning('[theme-switcher] could not read theme_preferences; falling back to '
+                    . 'global default. Run the plugin migration to fix. Error: ' . $e->getMessage());
+            }
+
+            return null;
+        }
+    }
+
     private function resolveActiveTheme(int $userId): ?string
     {
-        $pref = ThemePreference::where('user_id', $userId)->value('theme_id');
+        $pref = $this->readThemePreference($userId);
 
         if ($pref === 'default') return 'none';
         if ($pref !== null)      return $pref;
