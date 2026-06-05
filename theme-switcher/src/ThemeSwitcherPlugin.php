@@ -477,8 +477,14 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
 
         return <<<JS
 (function () {
-    var active = typeof window.__activeTheme !== 'undefined' ? window.__activeTheme : null;
-    if (active === null) return;
+    // Read the active theme live each time rather than capturing it once. doInstantSwitch()
+    // updates window.__activeTheme when the user switches without a reload; the long-lived
+    // observers below must honour that new value, otherwise restoring an inactive theme's
+    // CSS/DOM (e.g. starrynight) would be immediately re-suppressed against the stale value.
+    function currentActive() {
+        return typeof window.__activeTheme !== 'undefined' ? window.__activeTheme : null;
+    }
+    if (currentActive() === null) return;
     var rules = {$rulesJson};
 
     function applyRule(rule) {
@@ -498,6 +504,7 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
     }
 
     function suppress() {
+        var active = currentActive();
         Object.keys(rules).forEach(function (id) {
             if (id !== active) applyRule(rules[id]);
         });
@@ -514,6 +521,7 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
     // on dark/light mode toggle). Setting href to '' triggers this observer, but
     // getAttribute('href') is then falsy so we skip — no infinite loop.
     var hrefObs = new MutationObserver(function () {
+        var active = currentActive();
         Object.keys(rules).forEach(function (id) {
             if (id === active) return;
             (rules[id].clearHref || []).forEach(function (sel) {
@@ -642,6 +650,10 @@ JS;
     }
 
     function doInstantSwitch(id, btn) {
+        // Keep window.__activeTheme in sync so the suppression script's live observers
+        // treat the newly-selected theme as active and don't re-suppress its CSS/DOM.
+        // 'default' maps to 'none' to match what the server injects for the Pelican default.
+        window.__activeTheme = (id === 'default') ? 'none' : id;
         if (id === 'default') {
             ['ts-active-style', 'ts-instant-style', 'ts-instant-font'].forEach(function (eid) {
                 var el = document.getElementById(eid);
