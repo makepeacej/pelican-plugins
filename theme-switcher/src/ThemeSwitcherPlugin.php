@@ -13,6 +13,7 @@ use Filament\Support\Colors\Color;
 use Filament\Support\Colors\ColorManager;
 use Filament\Support\Facades\FilamentColor;
 use Illuminate\Foundation\Vite;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Route;
 use ReflectionClass;
@@ -147,15 +148,44 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
                 ->label('Global Default Theme')
                 ->helperText('Applied for users who have not chosen a personal theme, including the login page.')
                 ->options($options)
-                ->default(fn () => config('theme-switcher.default_theme', 'none')),
+                // `?:` so an empty/unset value falls back to 'none' instead of rendering a
+                // blank option ('' is not a valid choice in $options).
+                ->default(fn () => config('theme-switcher.default_theme') ?: 'none'),
         ];
     }
 
     public function saveSettings(array $data): void
     {
+        $value = $data['default_theme'] ?? '';
+
         $this->writeToEnvironment([
-            'PANEL_DEFAULT_THEME' => $data['default_theme'] ?? '',
+            'PANEL_DEFAULT_THEME' => $value,
         ]);
+
+        // Reflect the new value for the remainder of this request immediately.
+        config(['theme-switcher.default_theme' => $value]);
+
+        // The global default is the ONLY setting read from env via config() — personal
+        // themes live in the DB and so are always fresh. Pelican runs with cached config by
+        // default, which means the value baked into bootstrap/cache/config.php keeps shadowing
+        // the .env line we just wrote on every subsequent request. resolveGlobalDefault() would
+        // then keep reading the stale '' and fall back to "None" for every preference-less user
+        // (and the login page). Rebuild the cache so the saved default actually reaches users;
+        // if rebuilding fails (e.g. permissions), drop the cache so .env is read fresh instead
+        // of continuing to serve the stale value. No-op when config isn't cached.
+        if (app()->configurationIsCached()) {
+            try {
+                Artisan::call('config:cache');
+            } catch (\Throwable $e) {
+                try {
+                    Artisan::call('config:clear');
+                } catch (\Throwable) {
+                }
+                Log::warning('[theme-switcher] could not rebuild config cache after saving the '
+                    . 'global default theme; the change may not apply until config is cleared. '
+                    . 'Error: ' . $e->getMessage());
+            }
+        }
 
         Notification::make()
             ->title('Theme settings saved')
