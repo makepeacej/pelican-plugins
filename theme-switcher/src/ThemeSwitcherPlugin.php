@@ -412,9 +412,15 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
                 }
             }
         }
-        // Always write --font-family. Without this, a font set by another theme plugin's boot()
-        // (which may run after our reset) bleeds into the compiled Filament theme CSS and persists.
-        $css .= $font !== null ? "--font-family:'{$font}';" : '--font-family:initial;';
+        // Only override --font-family when this theme actually specifies one. Forcing 'initial'
+        // for fontless themes (Nord, Starry Night) clobbered Filament's own --font-family (Inter):
+        // Filament's theme CSS resolves the body font from var(--font-family), and a custom property
+        // set to the keyword 'initial' is guaranteed-invalid, which poisons that var() and drops the
+        // whole panel to the browser default (a serif). Leaving it untouched lets boot()'s
+        // $panel->font() (or Filament's default Inter) stand.
+        if ($font !== null) {
+            $css .= "--font-family:'{$font}';";
+        }
         $css .= '}';
         return "<style id=\"ts-active-style\">{$css}</style>";
     }
@@ -729,9 +735,12 @@ JS;
                 }
             });
         }
-        // Always write --font-family: use theme font, or reset to initial so Filament's
-        // own injected --font-family (from the active server-side theme) doesn't bleed through.
-        css += m && m.font ? "--font-family:'" + m.font + "';" : '--font-family:initial;';
+        // Only set --font-family when the theme specifies one. Forcing 'initial' for a fontless
+        // theme is guaranteed-invalid and poisons Filament's font-family:var(--font-family) rule,
+        // dropping the panel to the browser default (serif). Omitting it lets Filament's Inter stand.
+        if (m && m.font) {
+            css += "--font-family:'" + m.font + "';";
+        }
         css += '}';
         var el = document.createElement('style');
         el.id = 'ts-instant-style';
@@ -818,11 +827,9 @@ JS;
                 var el = document.getElementById(eid);
                 if (el) el.remove();
             });
-            // Reset --font-family so Filament's server-side font injection doesn't persist.
-            var resetEl = document.createElement('style');
-            resetEl.id = 'ts-instant-style';
-            resetEl.textContent = ':root{--font-family:initial;}';
-            document.head.appendChild(resetEl);
+            // The instant styles above are removed; Filament's own --font-family (Inter) in
+            // @filamentStyles then stands, so no font reset is needed. (Forcing 'initial' here
+            // would drop the panel to the browser default serif.)
             applyInstantRules('default');
         } else {
             var oldActive = document.getElementById('ts-active-style');
