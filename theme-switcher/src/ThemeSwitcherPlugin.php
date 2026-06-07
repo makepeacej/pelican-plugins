@@ -27,8 +27,15 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
 {
     use EnvironmentWriterTrait;
 
-    /** ColorManager::$colors snapshot taken before Panel::boot() appends any theme entries. */
-    private array $cmColorsAtRegister = [];
+    /**
+     * Pelican's baseline ColorManager::$colors, captured the first time boot() runs.
+     *
+     * Captured in boot() — NOT register() — because Pelican registers its palette (primary => Blue)
+     * in FilamentServiceProvider::boot(), which runs AFTER this plugin's register(). Snapshotting at
+     * register() captured an EMPTY array, so restoring to it wiped Pelican's Blue and let Filament's
+     * DEFAULT_COLORS amber primary win. Null until the first boot() captures the real baseline.
+     */
+    private ?array $cmBaseColors = null;
 
     public function getId(): string
     {
@@ -39,23 +46,22 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
     {
         app()->register(ThemeSwitcherServiceProvider::class);
 
-        // Snapshot ColorManager entries now — only Pelican's FilamentServiceProvider
-        // entries exist at this point. Panel::boot() hasn't run yet so no theme plugin
-        // colors have been appended. We'll restore to this in boot() to undo whatever
-        // Panel::boot() and getColors() add.
-        $this->cmColorsAtRegister = \Closure::bind(
-            fn (ColorManager $cm) => $cm->colors,
-            null,
-            ColorManager::class
-        )(app(ColorManager::class));
-
         $panel->authenticatedRoutes(function () {
             Route::post('theme-switcher/preference', [ThemePreferenceController::class, 'store'])
                 ->name('theme-switcher.preference.store');
         });
 
         $panel->renderHook('panels::head.end', function () use ($panel) {
-            return $this->renderHeadScripts($panel);
+            // Never let a render failure 500 the whole panel — this hook runs on every authenticated
+            // page. Degrade to injecting nothing and log once-ish instead.
+            try {
+                return $this->renderHeadScripts($panel);
+            } catch (\Throwable $e) {
+                Log::warning('[theme-switcher] head render hook failed; injecting nothing. Error: '
+                    . $e->getMessage());
+
+                return '';
+            }
         });
     }
 
@@ -74,6 +80,21 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
         } else {
             $active = $this->resolveGlobalDefault();
         }
+
+        // Everything below reaches into Filament's private Panel/ColorManager internals via reflection.
+        // Those names are version-specific (they shifted between Filament majors), so a mismatch here
+        // would throw during panel boot and 500 every authenticated page. Guard the whole block: on
+        // failure, log once and leave the panel at Pelican's defaults rather than breaking it.
+        try {
+        // Capture Pelican's baseline ColorManager state once, BEFORE this plugin perturbs it. At the
+        // first boot() (request time) Pelican's FilamentServiceProvider::boot() has already registered
+        // primary => Blue, so this captures the real palette. (register() ran too early and only ever
+        // saw an empty array, which is why restoring to it wiped Blue and surfaced Filament's amber.)
+        $this->cmBaseColors ??= \Closure::bind(
+            fn (ColorManager $cm) => $cm->colors,
+            null,
+            ColorManager::class
+        )(app(ColorManager::class));
 
         // Reset colors/font/viteTheme so multiple installed theme plugins don't merge.
         $ref = new ReflectionClass($panel);
@@ -116,12 +137,12 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
             }
         }
 
-        // Restore ColorManager to its pre-Panel::boot() state (snapshotted in register()),
-        // then add back only the active theme's colors. array_pop is unreliable because
-        // FilamentColor::getColors() permanently prepends DEFAULT_COLORS to $cm->colors on
-        // each cache miss — making pop remove DEFAULT instead of the theme entry.
+        // Restore ColorManager to Pelican's baseline (captured above this request), then add back only
+        // the active theme's colors. array_pop is unreliable because FilamentColor::getColors()
+        // permanently prepends DEFAULT_COLORS to $cm->colors on each cache miss — making pop remove
+        // DEFAULT instead of the theme entry.
         $correctColors = $panel->getColors();
-        $baseColors    = $this->cmColorsAtRegister;
+        $baseColors    = $this->cmBaseColors ?? [];
 
         \Closure::bind(function (ColorManager $cm) use ($baseColors, $correctColors) {
             $cm->colors = $baseColors;
@@ -130,6 +151,21 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
             }
             unset($cm->cachedColors);
         }, null, ColorManager::class)(app(ColorManager::class));
+
+        // Rewriting ColorManager::$colors above is not enough on its own: FilamentColor::getColors()
+        // re-resolves the REGISTRATION list (and re-prepends DEFAULT_COLORS) on each cache miss, so a
+        // side-channel theme that registered its palette via $panel->colors() (Starry Night → purple)
+        // re-applies it and clobbers the edit. Filament lets LATER registrations override earlier ones,
+        // and theme-switcher boots after every theme plugin — so registering the resolved palette
+        // through the PUBLIC color API here makes it win for real. Omitted keys fall back to Pelican.
+        $resolved = ($active && $active !== 'none')
+            ? array_replace($this->pelicanDefaultColors(), $this->loadThemeManifest($active)['colors'] ?? [])
+            : $this->pelicanDefaultColors();
+        FilamentColor::register($resolved);
+        } catch (\Throwable $e) {
+            Log::warning('[theme-switcher] boot() could not apply theme state (Filament internals '
+                . 'may have changed); leaving panel at defaults. Error: ' . $e->getMessage());
+        }
     }
 
     // ── HasPluginSettings ────────────────────────────────────────────────────
@@ -271,14 +307,33 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
             return $cache[$themeId] = ($staticConfig ?: null);
         }
 
-        $capture = new PanelColorCapture();
-        $plugin->register($capture);
-
-        // Prefer dynamic values from the plugin; fall back to static config
-        // for themes (like Neobrutalism) whose plugin skips $panel->colors().
-        $dynamicColors    = $capture->getCapturedColors();
-        $dynamicFont      = $capture->getCapturedFont();
-        $dynamicViteTheme = $capture->getCapturedViteTheme();
+        // Capture what the theme plugin's register() sets on a throwaway PanelColorCapture, then
+        // prefer those dynamic values, falling back to static config for themes (like Neobrutalism)
+        // whose plugin skips $panel->colors().
+        //
+        // Guard the whole capture. $plugin->register($capture) executes a THIRD-PARTY plugin against
+        // a fake Panel subclass, and this method runs in boot() AND the head render hook for every
+        // authenticated request. A throw here therefore 500s the entire panel — which is exactly what
+        // happened under Filament v5 (the plugin's register() type hint rejecting PanelColorCapture,
+        // and stale-opcache class definitions during a re-import). On any failure, log once and fall
+        // back to the theme's static manifest config so the panel keeps rendering.
+        $dynamicColors    = [];
+        $dynamicFont      = null;
+        $dynamicViteTheme = null;
+        try {
+            $capture = new PanelColorCapture();
+            $plugin->register($capture);
+            $dynamicColors    = $capture->getCapturedColors();
+            $dynamicFont      = $capture->getCapturedFont();
+            $dynamicViteTheme = $capture->getCapturedViteTheme();
+        } catch (\Throwable $e) {
+            static $captureLogged = [];
+            if (! isset($captureLogged[$themeId])) {
+                $captureLogged[$themeId] = true;
+                Log::warning('[theme-switcher] could not capture register() for theme "' . $themeId
+                    . '"; falling back to static manifest config. Error: ' . $e->getMessage());
+            }
+        }
 
         $colors    = ! empty($dynamicColors)    ? $dynamicColors    : ($staticConfig['colors']    ?? []);
         $font      = $dynamicFont    !== null   ? $dynamicFont      : ($staticConfig['font']      ?? null);
@@ -389,9 +444,17 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
             ? $this->resolveActiveTheme($user->id)
             : $this->resolveGlobalDefault();
 
+        // An unconfigured global default ('' → null) must render as vanilla Pelican, identical to an
+        // explicit "None": coerce null → 'none' so window.__activeTheme is set and the suppression
+        // script runs, clearing every installed theme plugin's CSS instead of letting it leak globally.
+        $activeTheme ??= 'none';
+
         $cssOverride    = '';
         $fontLinkHtml   = '';
         $viteThemeHtml  = '';
+        // Guard the color/font/vite section independently so a failure here cannot take down the
+        // suppression fragment (built below), which hides inactive themes' CSS/DOM.
+        try {
         if ($activeTheme !== null && $activeTheme !== 'none') {
             $manifest = $this->loadThemeManifest($activeTheme);
             // Always build the CSS override so --font-family is injected via ts-active-style and
@@ -426,23 +489,37 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
                 }
             }
         } else {
-            // 'none' — user chose Pelican's default. @filamentStyles may still contain
-            // a merged theme's colors (ColorManager::scoped() resets make it unreliable
-            // to clear at boot-time). ts-active-style appears after @filamentStyles in
-            // <head> so it wins the cascade. We inject Pelican's actual defaults
-            // directly from their Color constants (already resolved to OKLCH arrays).
-            $cssOverride = $this->buildCssOverride($this->pelicanDefaultColors(), null);
+            // No active theme. The Pelican-default reset only has a job to do when boot() actually
+            // baked a theme's palette into @filamentStyles. boot() runs before the session starts, so
+            // it always bakes the GLOBAL DEFAULT theme's colors for everyone — a 'none' user then needs
+            // ts-active-style (which sits after @filamentStyles in <head>) to override them back to
+            // Pelican's defaults.
+            //
+            // But when the global default is ITSELF 'none'/unset, boot baked nothing, so @filamentStyles
+            // already holds Pelican's own defaults. Injecting the reset in that case overrides Pelican's
+            // live CSS with our reconstructed pelicanDefaultColors() — and any drift between the two
+            // (shade set, format, or a key Pelican computes differently) shows up as a visible color
+            // change with NO theme selected (the reported bug). So only inject when a real global default
+            // theme is configured; otherwise leave Pelican's CSS untouched.
+            $globalDefault = $this->resolveGlobalDefault();
+            if ($globalDefault !== null && $globalDefault !== 'none') {
+                $cssOverride = $this->buildCssOverride($this->pelicanDefaultColors(), null);
+            }
+        }
+        } catch (\Throwable $e) {
+            Log::warning('[theme-switcher] head color/vite section failed; skipping it. Error: '
+                . $e->getMessage());
+            $cssOverride = $fontLinkHtml = $viteThemeHtml = '';
         }
 
-        $activeThemeScript = '';
-        if ($activeTheme !== null) {
-            $json = json_encode($activeTheme, JSON_THROW_ON_ERROR | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT);
-            $activeThemeScript = "window.__activeTheme = {$json};";
-        }
+        // Build suppression FIRST and unconditionally — it (and window.__activeTheme) must survive
+        // even if the color or picker sections throw. buildSuppressionScript returns a self-contained
+        // <style>+<script> fragment that also publishes window.__activeTheme.
+        $suppressionFragment = $this->buildSuppressionScript($activeTheme);
 
-        $suppressionScript = $this->buildSuppressionScript($activeTheme);
-
-        $pickerScript = '';
+        // Guard the picker section independently for the same reason.
+        $pickerFragment = '';
+        try {
         if ($user) {
             $themes = app(ThemeDiscoveryService::class)->discover();
 
@@ -489,18 +566,24 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
                     'rules'      => $rulesForJs,
                 ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
 
-                $pickerScript = $this->buildPickerScript($configJson);
+                $pickerFragment = "<script>\n" . $this->buildPickerScript($configJson) . "\n</script>";
             }
         }
+        } catch (\Throwable $e) {
+            Log::warning('[theme-switcher] head picker section failed; skipping it. Error: '
+                . $e->getMessage());
+            $pickerFragment = '';
+        }
 
-        return "{$fontLinkHtml}{$viteThemeHtml}{$cssOverride}<script>\n{$activeThemeScript}\n{$suppressionScript}\n{$pickerScript}\n</script>";
+        return "{$fontLinkHtml}{$viteThemeHtml}{$cssOverride}{$suppressionFragment}{$pickerFragment}";
     }
 
     private function buildSuppressionScript(?string $activeTheme): string
     {
-        if ($activeTheme === null) {
-            return '';
-        }
+        // activeTheme is coerced to 'none' (never null) by renderHeadScripts before this call;
+        // guard anyway so window.__activeTheme is always a valid value.
+        $active          = $activeTheme ?? 'none';
+        $activeThemeJson = json_encode($active, JSON_THROW_ON_ERROR | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT);
 
         // Collect deactivate rules from all discovered themes dynamically.
         $rules = [];
@@ -511,13 +594,33 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
             }
         }
 
+        // Always publish the active theme so the picker (and any later script) can read it,
+        // even when no installed theme needs side-channel suppression.
         if (empty($rules)) {
-            return '';
+            return "<script>\nwindow.__activeTheme = {$activeThemeJson};\n</script>";
         }
 
         $rulesJson = json_encode($rules, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE);
 
-        return <<<JS
+        // Build a static, gated stylesheet that hides each theme's injected DOM while that theme
+        // is inactive. Gating on html[data-ts-suppress~="<id>"] means re-created nodes (Starry
+        // Night re-adds #starrynight-stars via its own observer) stay hidden by the cascade with
+        // no JS race, and activation lifts the gate simply by editing the attribute.
+        $cssRules = [];
+        foreach ($rules as $themeId => $rule) {
+            if (empty($rule['hide'])) {
+                continue;
+            }
+            $gate      = 'html[data-ts-suppress~="' . $themeId . '"]';
+            $selectors = array_map(fn ($sel) => $gate . ' ' . $sel, $rule['hide']);
+            $cssRules[] = implode(",\n", $selectors) . ' { display: none !important; }';
+        }
+        $gatedCss  = implode("\n", $cssRules);
+        $styleHtml = $gatedCss !== '' ? "<style id=\"ts-suppress-style\">\n{$gatedCss}\n</style>\n" : '';
+
+        return $styleHtml . <<<JS
+<script>
+window.__activeTheme = {$activeThemeJson};
 (function () {
     // Read the active theme live each time rather than capturing it once. doInstantSwitch()
     // updates window.__activeTheme when the user switches without a reload; the long-lived
@@ -528,27 +631,40 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
     }
     if (currentActive() === null) return;
     var rules = {$rulesJson};
+    var root = document.documentElement;
 
-    function applyRule(rule) {
+    // Neutralise an inactive theme's stylesheet links. Setting el.disabled = true wins even if
+    // the theme re-sets href afterwards (Starry Night's apply() only compares href, never the
+    // disabled flag), so this ends the strip-href/re-add-href observer war. media = 'not all'
+    // is a belt-and-suspenders fallback; href is still stashed/removed as well.
+    function disableLinks(rule) {
         (rule.clearHref || []).forEach(function (sel) {
             document.querySelectorAll(sel).forEach(function (el) {
+                el.disabled = true;
+                el.media = 'not all';
                 var href = el.getAttribute('href');
-                // Remove the href entirely — a <link> with no href is ignored by the browser.
-                // Setting href='' would resolve to '/' and load the page as a stylesheet.
                 if (href) { el.setAttribute('data-ts-href', href); el.removeAttribute('href'); }
-            });
-        });
-        (rule.hide || []).forEach(function (sel) {
-            document.querySelectorAll(sel).forEach(function (el) {
-                el.style.display = 'none';
             });
         });
     }
 
+    // Maintain the gate attribute: every inactive theme id that has rules. The server-emitted
+    // #ts-suppress-style hides those themes' DOM via html[data-ts-suppress~="<id>"] ... .
+    function updateGate() {
+        var active = currentActive();
+        var inactive = Object.keys(rules).filter(function (id) { return id !== active; });
+        if (inactive.length) {
+            root.setAttribute('data-ts-suppress', inactive.join(' '));
+        } else {
+            root.removeAttribute('data-ts-suppress');
+        }
+    }
+
     function suppress() {
         var active = currentActive();
+        updateGate();
         Object.keys(rules).forEach(function (id) {
-            if (id !== active) applyRule(rules[id]);
+            if (id !== active) disableLinks(rules[id]);
         });
     }
 
@@ -559,29 +675,24 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
     window.addEventListener('turbo:load', suppress);
     window.addEventListener('turbo:render', suppress);
 
-    // Intercept href changes on inactive theme CSS links (e.g. starrynight re-applying
-    // on dark/light mode toggle). Setting href to '' triggers this observer, but
-    // getAttribute('href') is then falsy so we skip — no infinite loop.
-    var hrefObs = new MutationObserver(function () {
+    // Re-disable inactive theme CSS links inserted or re-href'd after load (e.g. Starry Night
+    // re-applying on a dark/light toggle). Acts by selector regardless of href, so the
+    // initially href-less <link id="starrynight-css"> is caught the moment it is inserted.
+    var linkObs = new MutationObserver(function () {
         var active = currentActive();
         Object.keys(rules).forEach(function (id) {
             if (id === active) return;
-            (rules[id].clearHref || []).forEach(function (sel) {
-                document.querySelectorAll(sel).forEach(function (el) {
-                    var href = el.getAttribute('href');
-                    if (href) { el.setAttribute('data-ts-href', href); el.removeAttribute('href'); }
-                });
-            });
+            disableLinks(rules[id]);
         });
     });
     if (document.head) {
-        hrefObs.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
+        linkObs.observe(document.head, { childList: true, subtree: true, attributes: true, attributeFilter: ['href'] });
     }
 
-    // Hide any inactive-theme DOM elements added after initial load.
-    // Only watches childList — style mutations don't re-trigger.
-    new MutationObserver(suppress).observe(document.documentElement, { childList: true, subtree: true });
+    // Keep the gate correct if inactive-theme DOM is (re-)added after load.
+    new MutationObserver(updateGate).observe(document.documentElement, { childList: true, subtree: true });
 })();
+</script>
 JS;
     }
 
@@ -643,21 +754,24 @@ JS;
 
     function applyInstantRules(newId) {
         var rules = cfg.rules || {};
-        Object.keys(rules).forEach(function (id) {
-            if (id === newId) return;
-            var rule = rules[id];
-            (rule.clearHref || []).forEach(function (sel) {
+        var inactive = Object.keys(rules).filter(function (id) { return id !== newId; });
+        inactive.forEach(function (id) {
+            (rules[id].clearHref || []).forEach(function (sel) {
                 document.querySelectorAll(sel).forEach(function (el) {
+                    // Disable wins even if the theme re-sets href (see suppression script).
+                    el.disabled = true;
+                    el.media = 'not all';
                     var href = el.getAttribute('href');
                     if (href) { el.setAttribute('data-ts-href', href); el.removeAttribute('href'); }
                 });
             });
-            (rule.hide || []).forEach(function (sel) {
-                document.querySelectorAll(sel).forEach(function (el) {
-                    el.style.display = 'none';
-                });
-            });
         });
+        // Hide every inactive theme's DOM via the gated #ts-suppress-style stylesheet.
+        if (inactive.length) {
+            document.documentElement.setAttribute('data-ts-suppress', inactive.join(' '));
+        } else {
+            document.documentElement.removeAttribute('data-ts-suppress');
+        }
     }
 
     function activateTheme(id) {
@@ -665,15 +779,18 @@ JS;
         if (!rule) return;
         (rule.clearHref || []).forEach(function (sel) {
             document.querySelectorAll(sel).forEach(function (el) {
+                el.disabled = false;
+                el.media = '';
                 var orig = el.getAttribute('data-ts-href');
                 if (orig) el.setAttribute('href', orig);
             });
         });
-        (rule.hide || []).forEach(function (sel) {
-            document.querySelectorAll(sel).forEach(function (el) {
-                el.style.removeProperty('display');
-            });
-        });
+        // Lift the hide gate for the now-active theme so its DOM (stars/meteors) shows again.
+        var root = document.documentElement;
+        var cur = (root.getAttribute('data-ts-suppress') || '').split(' ').filter(Boolean);
+        var next = cur.filter(function (x) { return x !== id; });
+        if (next.length) { root.setAttribute('data-ts-suppress', next.join(' ')); }
+        else { root.removeAttribute('data-ts-suppress'); }
     }
 
     function updatePickerUi(newId) {
