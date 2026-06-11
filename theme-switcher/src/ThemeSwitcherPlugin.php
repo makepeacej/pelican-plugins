@@ -67,10 +67,28 @@ class ThemeSwitcherPlugin implements HasPluginSettings, Plugin
 
     public function boot(Panel $panel): void
     {
-        // StartSession runs before SetUpPanel, so auth()->guard() is available here.
+        // boot() runs in the SetUpPanel middleware, BEFORE the authentication middleware, so on a real
+        // HTTP request auth()->user() is usually NULL here — we cannot read the DB preference yet.
+        // That matters for more than colors: Filament computes a button's (dark-mode) label color from
+        // the registered palette's WCAG contrast, so if boot() applies the wrong success/info palette,
+        // the label SHADE is baked wrong and a render-time CSS override can't fix it (it's a class, not
+        // a variable). The picker writes a PLAIN $_COOKIE['active_theme'] (readable before auth) for
+        // exactly this — use it to apply the user's theme at boot. Validate against installed themes;
+        // fall back to the DB preference (if a user happens to be resolved) or the global default.
+        // renderHeadScripts() re-resolves from the DB at render time as the source of truth.
         $user = auth()->guard($panel->getAuthGuard())->user();
 
-        if ($user) {
+        $cookie    = $_COOKIE['active_theme'] ?? null;
+        $installed = array_keys(app(ThemeDiscoveryService::class)->discover());
+        $cookieTheme = match (true) {
+            $cookie === 'default'                                    => 'none',
+            $cookie !== null && in_array($cookie, $installed, true)  => $cookie,
+            default                                                  => null,
+        };
+
+        if ($cookieTheme !== null) {
+            $active = $cookieTheme;
+        } elseif ($user) {
             $pref = $this->readThemePreference($user->id);
             $active = match(true) {
                 $pref === 'default' => 'none',
